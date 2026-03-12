@@ -7,7 +7,6 @@ from streamlit_calendar import calendar
 
 # --- 1. 基础配置与时区设定 ---
 DB_NAME = "work_master.db"
-# 强制指定东八区时区
 CHINA_TZ = pytz.timezone('Asia/Shanghai')
 
 def get_now():
@@ -53,7 +52,8 @@ init_db()
 with st.sidebar:
     st.header("⚙️ 考勤规则")
     def_start = st.time_input("默认上班时间", time(8, 30))
-    std_end = st.time_input("标准下班时间", time(18, 0))
+    # 注意：现在标准下班时间仅作为界面参考，计算逻辑已改为工时倒推
+    std_end_ref = st.time_input("参考下班时间", time(18, 0))
     st.subheader("☕ 午休时段")
     b_start = st.time_input("开始", time(12, 0))
     b_end = st.time_input("结束", time(13, 30))
@@ -63,7 +63,7 @@ with st.sidebar:
             conn.execute("DELETE FROM attendance")
         st.cache_data.clear()
         st.rerun()
-    st.caption("提示：时区已锁定为北京时间(GMT+8)")
+    st.caption("逻辑已更新：纯工时满8h后开始计算加班")
 
 # --- 4. 移动端适配布局：使用 Tabs 切换 ---
 tab_record, tab_calendar = st.tabs(["⏱️ 快速打卡", "📅 历史月历"])
@@ -73,49 +73,51 @@ with tab_record:
     now = get_now()
     today_str = now.strftime("%Y-%m-%d")
     
-    # 初始化 session_state
     if 'today_start' not in st.session_state:
         st.session_state.today_start = def_start.strftime("%H:%M:%S")
 
     st.subheader(f"📅 今日：{today_str}")
     
-    # 打卡按钮布局
     c1, c2 = st.columns(2)
     if c1.button("☀️ 上班打卡", use_container_width=True):
         st.session_state.today_start = now.strftime("%H:%M:%S")
         st.rerun()
 
     if c2.button("🌙 下班打卡", type="primary", use_container_width=True):
-        # 核心逻辑：时区感知的时间计算
-        # 将 start_time 字符串转回带时区的 datetime
+        # --- 核心逻辑修复点：工时倒推法 ---
         start_time_obj = datetime.strptime(st.session_state.today_start, "%H:%M:%S").time()
         start_dt = CHINA_TZ.localize(datetime.combine(now.date(), start_time_obj))
         
-        bs_dt, be_dt, se_dt = [CHINA_TZ.localize(datetime.combine(now.date(), t)) for t in [b_start, b_end, std_end]]
+        # 午休判定逻辑
+        bs_dt = CHINA_TZ.localize(datetime.combine(now.date(), b_start))
+        be_dt = CHINA_TZ.localize(datetime.combine(now.date(), b_end))
         
-        # 判定扣除时长
+        total_seconds = (now - start_dt).total_seconds()
+        
+        # 智能扣除午休
         if now <= bs_dt:
             deduct = 0.0
         elif bs_dt < now <= be_dt:
-            deduct = (now - bs_dt).total_seconds() / 3600
+            deduct = (now - bs_dt).total_seconds()
         else:
-            deduct = (be_dt - bs_dt).total_seconds() / 3600
+            deduct = (be_dt - bs_dt).total_seconds()
             
-        work_h = round(max(0, (now - start_dt).total_seconds() / 3600 - deduct), 2)
-        ot_h = round(max(0, (now - se_dt).total_seconds() / 3600), 2)
+        # 实际工时 = 总用时 - 午休
+        work_h = round(max(0, (total_seconds - deduct) / 3600), 2)
+        # 加班 = 实际工时 - 8小时标准工时 (无论你是几点打的卡)
+        ot_h = round(max(0, work_h - 8.0), 2)
 
         with sqlite3.connect(DB_NAME) as conn:
             conn.execute("REPLACE INTO attendance VALUES (?,?,?,?,?)",
                          (today_str, st.session_state.today_start, now.strftime("%H:%M:%S"), work_h, ot_h))
         
         st.cache_data.clear()
-        st.success(f"打卡成功！今日工时 {work_h}h")
+        st.success(f"打卡成功！今日工时 {work_h}h (加班 {ot_h}h)")
         st.balloons()
         st.rerun()
 
     st.info(f"当前记录起点: {st.session_state.today_start}")
 
-    # --- 历史补录 ---
     st.divider()
     with st.expander("📝 补录或修改历史记录"):
         with st.form("manual_entry", clear_on_submit=True):
@@ -125,14 +127,23 @@ with tab_record:
             m_end = mc2.time_input("下班时间", time(18, 0))
             
             if st.form_submit_button("确认保存", use_container_width=True):
-                # 补录计算逻辑
                 m_start_dt = datetime.combine(m_date, m_start)
                 m_end_dt = datetime.combine(m_date, m_end)
-                m_bs_dt, m_be_dt, m_std_end = [datetime.combine(m_date, t) for t in [b_start, b_end, std_end]]
+                m_bs_dt = datetime.combine(m_date, b_start)
+                m_be_dt = datetime.combine(m_date, b_end)
 
-                m_deduct = (m_be_dt - m_bs_dt).total_seconds() / 3600 if m_end_dt > m_be_dt else 0
-                m_work_h = round(max(0, (m_end_dt - m_start_dt).total_seconds() / 3600 - m_deduct), 2)
-                m_ot_h = round(max(0, (m_end_dt - m_std_end).total_seconds() / 3600), 2)
+                m_total_seconds = (m_end_dt - m_start_dt).total_seconds()
+                
+                # 补录午休扣除逻辑
+                if m_end_dt <= m_bs_dt:
+                    m_deduct = 0.0
+                elif m_bs_dt < m_end_dt <= m_be_dt:
+                    m_deduct = (m_end_dt - m_bs_dt).total_seconds()
+                else:
+                    m_deduct = (m_be_dt - m_bs_dt).total_seconds()
+
+                m_work_h = round(max(0, (m_total_seconds - m_deduct) / 3600), 2)
+                m_ot_h = round(max(0, m_work_h - 8.0), 2) # 只要满8h，多出的就是加班
 
                 with sqlite3.connect(DB_NAME) as conn:
                     conn.execute("REPLACE INTO attendance VALUES (?,?,?,?,?)",
